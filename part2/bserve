@@ -331,6 +331,16 @@ def handle_connection(sock, root):
             )
             continue
 
+        # Spec: a REQUEST must contain exactly one header, and it must be :path.
+        if len(headers) != 1 or headers[0][0] != ":path":
+            send_response(
+                sock,
+                stream_id,
+                400,
+                "Bad Request"
+            )
+            continue
+
         handle_request(
             sock,
             root,
