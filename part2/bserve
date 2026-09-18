@@ -290,6 +290,10 @@ def handle_connection(sock, root):
         if frame_body is None:
             return
 
+        # Unknown frame types must be skipped without decoding their contents.
+        if frame_type not in (REQUEST, RESPONSE):
+            continue
+
         try:
             headers, payload = decode_headers(
                 frame_body,
@@ -303,11 +307,6 @@ def handle_connection(sock, root):
                 "Bad Request"
             )
             return
-
-        if frame_type not in (REQUEST, RESPONSE):
-            # Unknown frame type:
-            # consume it completely and continue.
-            continue
 
         if frame_type == RESPONSE:
             # bserve is a server and does not expect responses.
