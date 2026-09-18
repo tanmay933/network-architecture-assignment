@@ -2,6 +2,15 @@
 
 **Author: Tanmay Mittal**
 
+![Java](https://img.shields.io/badge/Java-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![TCP](https://img.shields.io/badge/TCP-005571?style=for-the-badge)
+![HTTP/1.1](https://img.shields.io/badge/HTTP%2F1.1-005571?style=for-the-badge)
+![Networking](https://img.shields.io/badge/Computer%20Networking-6A1B9A?style=for-the-badge)
+![Sockets](https://img.shields.io/badge/Socket%20Programming-2E7D32?style=for-the-badge)
+![Binary Protocol](https://img.shields.io/badge/Binary%20Protocol-C62828?style=for-the-badge)
+![Network Architecture](https://img.shields.io/badge/Network%20Architecture-1565C0?style=for-the-badge)
+
 ## Overview
 
 This project implements two TCP-based network applications to demonstrate reliable message framing, persistent connections, and protocol design:
