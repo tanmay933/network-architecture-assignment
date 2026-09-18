@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+
+import os
+import socket
+import struct
+import sys
+
+
+REQUEST = 0x01
+RESPONSE = 0x02
+
+MAX_FRAME_SIZE = 16_777_215
+MAX_HEADERS = 255
+MAX_HEADER_VALUE = 65_535
+
+HEADER_NAMES = {
+    1: ":path",
+    2: ":status",
+    3: "content-type",
+    4: "content-length",
+    5: "server",
+    6: "error",
+    7: "host",
+    8: "file-name",
+    9: "request-id",
+    10: "connection",
+}
+
+HEADER_INDEX = {name: index for index, name in HEADER_NAMES.items()}
+
+
+def recv_exact(sock, size):
+    data = b""
+
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+
+        if not chunk:
+            return None
+
+        data += chunk
+
+    return data
+
+
+def encode_headers(headers):
+    if len(headers) > MAX_HEADERS:
+        raise ValueError("too many headers")
+
+    result = bytearray()
+
+    for name, value in headers:
+        value_bytes = value.encode("utf-8")
+
+        if len(value_bytes) > MAX_HEADER_VALUE:
+            raise ValueError("header value too large")
+
+        if name in HEADER_INDEX:
+            result.append(HEADER_INDEX[name])
+        else:
+            name_bytes = name.encode("utf-8")
+
+            if len(name_bytes) > 255:
+                raise ValueError("header name too large")
+
+            result.append(0xFF)
+            result.append(len(name_bytes))
+            result.extend(name_bytes)
+
+        result.extend(struct.pack(">H", len(value_bytes)))
+        result.extend(value_bytes)
+
+    return bytes(result)
+
+
+def decode_headers(data, header_count):
+    headers = []
+    offset = 0
+
+    if header_count > MAX_HEADERS:
+        raise ValueError("too many headers")
+
+    for _ in range(header_count):
+        if offset >= len(data):
+            raise ValueError("truncated header")
+
+        name_index = data[offset]
+        offset += 1
+
+        if name_index == 0xFF:
+            if offset >= len(data):
+                raise ValueError("truncated literal name")
+
+            name_length = data[offset]
+            offset += 1
+
+            if offset + name_length > len(data):
+                raise ValueError("truncated header name")
+
+            name = data[offset:offset + name_length].decode("utf-8")
+            offset += name_length
+
+        else:
+            if name_index not in HEADER_NAMES:
+                raise ValueError("unknown header index")
+
+            name = HEADER_NAMES[name_index]
+
+        if offset + 2 > len(data):
+            raise ValueError("truncated value length")
+
+        value_length = struct.unpack(
+            ">H",
+            data[offset:offset + 2]
+        )[0]
+
+        offset += 2
+
+        if offset + value_length > len(data):
+            raise ValueError("truncated header value")
+
+        value = data[offset:offset + value_length].decode("utf-8")
+        offset += value_length
+
+        headers.append((name, value))
+
+    if offset > len(data):
+        raise ValueError("invalid headers")
+
+    payload = data[offset:]
+
+    return headers, payload
+
+
+def build_frame(frame_type, flags, stream_id, headers, payload=b""):
+    if stream_id == 0:
+        raise ValueError("stream ID 0 is reserved")
+
+    header_bytes = encode_headers(headers)
+
+    body = header_bytes + payload
+
+    if len(body) > MAX_FRAME_SIZE:
+        raise ValueError("frame too large")
+
+    fixed_header = (
+        len(body).to_bytes(3, "big")
+        + bytes([frame_type])
+        + bytes([flags])
+        + struct.pack(">I", stream_id)
+        + bytes([len(headers)])
+    )
+
+    return fixed_header + body
+
+
+def send_response(sock, stream_id, status, error=None, payload=b""):
+    headers = [
+        (":status", str(status)),
+    ]
+
+    if status == 200:
+        headers.append(("content-length", str(len(payload))))
+    else:
+        headers.append(("error", error or "Error"))
+
+    frame = build_frame(
+        RESPONSE,
+        0,
+        stream_id,
+        headers,
+        payload
+    )
+
+    sock.sendall(frame)
+
+
+def safe_file_path(root, request_path):
+    if not request_path.startswith("/"):
+        raise ValueError("invalid path")
+
+    relative_path = request_path.lstrip("/")
+
+    if not relative_path:
+        raise ValueError("invalid path")
+
+    root = os.path.realpath(root)
+    candidate = os.path.realpath(
+        os.path.join(root, relative_path)
+    )
+
+    if candidate != root and not candidate.startswith(root + os.sep):
+        raise ValueError("path traversal")
+
+    return candidate
+
+
+def handle_request(sock, root, stream_id, headers):
+    path = None
+
+    for name, value in headers:
+        if name == ":path":
+            if path is not None:
+                send_response(
+                    sock,
+                    stream_id,
+                    400,
+                    "Bad Request"
+                )
+                return
+
+            path = value
+
+    if path is None:
+        send_response(
+            sock,
+            stream_id,
+            400,
+            "Bad Request"
+        )
+        return
+
+    try:
+        file_path = safe_file_path(root, path)
+    except (ValueError, UnicodeError):
+        send_response(
+            sock,
+            stream_id,
+            400,
+            "Bad Request"
+        )
+        return
+
+    if not os.path.isfile(file_path):
+        send_response(
+            sock,
+            stream_id,
+            404,
+            "Not Found"
+        )
+        return
+
+    try:
+        with open(file_path, "rb") as file:
+            payload = file.read()
+    except OSError:
+        send_response(
+            sock,
+            stream_id,
+            404,
+            "Not Found"
+        )
+        return
+
+    send_response(
+        sock,
+        stream_id,
+        200,
+        payload=payload
+    )
+
+
+def handle_connection(sock, root):
+    while True:
+        fixed = recv_exact(sock, 10)
+
+        if fixed is None:
+            return
+
+        length = int.from_bytes(fixed[0:3], "big")
+        frame_type = fixed[3]
+        flags = fixed[4]
+        stream_id = struct.unpack(">I", fixed[5:9])[0]
+        header_count = fixed[9]
+
+        if length > MAX_FRAME_SIZE:
+            return
+
+        if stream_id == 0:
+            send_response(
+                sock,
+                1,
+                400,
+                "Bad Request"
+            )
+            return
+
+        frame_body = recv_exact(sock, length)
+
+        if frame_body is None:
+            return
+
+        try:
+            headers, payload = decode_headers(
+                frame_body,
+                header_count
+            )
+        except (ValueError, UnicodeDecodeError):
+            send_response(
+                sock,
+                stream_id,
+                400,
+                "Bad Request"
+            )
+            return
+
+        if frame_type not in (REQUEST, RESPONSE):
+            # Unknown frame type:
+            # consume it completely and continue.
+            continue
+
+        if frame_type == RESPONSE:
+            # bserve is a server and does not expect responses.
+            send_response(
+                sock,
+                stream_id,
+                400,
+                "Bad Request"
+            )
+            continue
+
+        if flags != 0:
+            # Unknown flags are ignored according to the specification.
+            pass
+
+        if payload:
+            send_response(
+                sock,
+                stream_id,
+                400,
+                "Bad Request"
+            )
+            continue
+
+        handle_request(
+            sock,
+            root,
+            stream_id,
+            headers
+        )
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("Usage: ./bserve ./www 9000")
+        sys.exit(1)
+
+    root = os.path.realpath(sys.argv[1])
+
+    try:
+        port = int(sys.argv[2])
+    except ValueError:
+        print("Invalid port")
+        sys.exit(1)
+
+    if not os.path.isdir(root):
+        print("Web root does not exist")
+        sys.exit(1)
+
+    server = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_STREAM
+    )
+
+    server.setsockopt(
+        socket.SOL_SOCKET,
+        socket.SO_REUSEADDR,
+        1
+    )
+
+    server.bind(("0.0.0.0", port))
+    server.listen(10)
+
+    print(f"bserve listening on port {port}")
+
+    while True:
+        conn, address = server.accept()
+
+        print(f"Connection from {address}")
+
+        try:
+            handle_connection(conn, root)
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        finally:
+            conn.close()
+
+
+if __name__ == "__main__":
+    main()

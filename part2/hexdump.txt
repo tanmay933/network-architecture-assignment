@@ -1,0 +1,65 @@
+ANNOTATED HEXDUMP — COMPLETE REQUEST
+
+Request:
+./bcurl -v localhost:9000/index.html
+
+Fixed Header (10 bytes):
+00 00 0e 01 00 00 00 00 01 01
+
+00 00 0e    Length = 14 bytes
+01          Type = REQUEST
+00          Flags = 0
+00 00 00 01 Stream ID = 1
+01          Header Count = 1
+
+Header:
+01          Header name index = :path
+00 0b       Value length = 11
+2f 69 6e 64 65 78 2e 68 74 6d 6c
+            Value = "/index.html"
+
+Complete Request:
+00 00 0e 01 00 00 00 00 01 01
+01 00 0b 2f 69 6e 64 65 78 2e 68 74 6d 6c
+
+
+ANNOTATED HEXDUMP — COMPLETE RESPONSE
+
+Response:
+HTTP status = 200
+File = ./www/index.html
+
+Fixed Header (10 bytes):
+00 00 31 02 00 00 00 00 01 02
+
+00 00 31    Length = 49 bytes
+02          Type = RESPONSE
+00          Flags = 0
+00 00 00 01 Stream ID = 1
+02          Header Count = 2
+
+Header 1:
+02          Header name index = :status
+00 03       Value length = 3
+32 30 30    Value = "200"
+
+Header 2:
+04          Header name index = content-length
+00 02       Value length = 2
+33 38       Value = "38"
+
+Payload:
+48 65 6c 6c 6f 20 66 72 6f 6d 20 6d 79 20 62 69
+6e 61 72 79 20 70 72 6f 74 6f 63 6f 6c 20 73 65
+72 76 65 72 21 0a
+
+ASCII:
+Hello from my binary protocol server!
+
+Complete Response:
+00 00 31 02 00 00 00 00 01 02
+02 00 03 32 30 30
+04 00 02 33 38
+48 65 6c 6c 6f 20 66 72 6f 6d 20 6d 79 20 62 69
+6e 61 72 79 20 70 72 6f 74 6f 63 6f 6c 20 73 65
+72 76 65 72 21 0a

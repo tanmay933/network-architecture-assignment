@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+
+import socket
+import struct
+import sys
+
+
+REQUEST = 0x01
+RESPONSE = 0x02
+
+MAX_FRAME_SIZE = 16_777_215
+MAX_HEADERS = 255
+MAX_HEADER_VALUE = 65_535
+
+HEADER_NAMES = {
+    1: ":path",
+    2: ":status",
+    3: "content-type",
+    4: "content-length",
+    5: "server",
+    6: "error",
+    7: "host",
+    8: "file-name",
+    9: "request-id",
+    10: "connection",
+}
+
+HEADER_INDEX = {name: index for index, name in HEADER_NAMES.items()}
+
+
+def recv_exact(sock, size):
+    data = b""
+
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+
+        if not chunk:
+            return None
+
+        data += chunk
+
+    return data
+
+
+def encode_headers(headers):
+    if len(headers) > MAX_HEADERS:
+        raise ValueError("too many headers")
+
+    result = bytearray()
+
+    for name, value in headers:
+        value_bytes = value.encode("utf-8")
+
+        if len(value_bytes) > MAX_HEADER_VALUE:
+            raise ValueError("header value too large")
+
+        if name in HEADER_INDEX:
+            result.append(HEADER_INDEX[name])
+        else:
+            name_bytes = name.encode("utf-8")
+
+            if len(name_bytes) > 255:
+                raise ValueError("header name too large")
+
+            result.append(0xFF)
+            result.append(len(name_bytes))
+            result.extend(name_bytes)
+
+        result.extend(struct.pack(">H", len(value_bytes)))
+        result.extend(value_bytes)
+
+    return bytes(result)
+
+
+def decode_headers(data, header_count):
+    headers = []
+    offset = 0
+
+    if header_count > MAX_HEADERS:
+        raise ValueError("too many headers")
+
+    for _ in range(header_count):
+        if offset >= len(data):
+            raise ValueError("truncated header")
+
+        name_index = data[offset]
+        offset += 1
+
+        if name_index == 0xFF:
+            if offset >= len(data):
+                raise ValueError("truncated literal name")
+
+            name_length = data[offset]
+            offset += 1
+
+            if offset + name_length > len(data):
+                raise ValueError("truncated header name")
+
+            name = data[offset:offset + name_length].decode("utf-8")
+            offset += name_length
+
+        else:
+            if name_index not in HEADER_NAMES:
+                raise ValueError("unknown header index")
+
+            name = HEADER_NAMES[name_index]
+
+        if offset + 2 > len(data):
+            raise ValueError("truncated value length")
+
+        value_length = struct.unpack(
+            ">H",
+            data[offset:offset + 2]
+        )[0]
+
+        offset += 2
+
+        if offset + value_length > len(data):
+            raise ValueError("truncated header value")
+
+        value = data[offset:offset + value_length].decode("utf-8")
+        offset += value_length
+
+        headers.append((name, value))
+
+    payload = data[offset:]
+
+    return headers, payload
+
+
+def build_frame(frame_type, flags, stream_id, headers, payload=b""):
+    if stream_id == 0:
+        raise ValueError("stream ID 0 is reserved")
+
+    header_bytes = encode_headers(headers)
+    body = header_bytes + payload
+
+    if len(body) > MAX_FRAME_SIZE:
+        raise ValueError("frame too large")
+
+    fixed_header = (
+        len(body).to_bytes(3, "big")
+        + bytes([frame_type])
+        + bytes([flags])
+        + struct.pack(">I", stream_id)
+        + bytes([len(headers)])
+    )
+
+    return fixed_header + body
+
+
+def print_hexdump(label, data):
+    print(label)
+
+    for offset in range(0, len(data), 16):
+        chunk = data[offset:offset + 16]
+
+        hex_bytes = " ".join(
+            f"{byte:02x}" for byte in chunk
+        )
+
+        ascii_bytes = "".join(
+            chr(byte) if 32 <= byte <= 126 else "."
+            for byte in chunk
+        )
+
+        print(
+            f"{offset:04x}  "
+            f"{hex_bytes:<47}  "
+            f"|{ascii_bytes}|"
+        )
+
+
+def parse_url(value):
+    if ":" not in value:
+        raise ValueError("expected host:port/path")
+
+    host_port, path = value.split("/", 1)
+
+    if ":" not in host_port:
+        raise ValueError("expected host:port")
+
+    host, port_text = host_port.rsplit(":", 1)
+
+    port = int(port_text)
+
+    return host, port, "/" + path
+
+
+def main():
+    verbose = False
+    args = sys.argv[1:]
+
+    if args and args[0] == "-v":
+        verbose = True
+        args = args[1:]
+
+    if len(args) != 1:
+        print("Usage: ./bcurl [-v] localhost:9000/index.html")
+        sys.exit(1)
+
+    try:
+        host, port, path = parse_url(args[0])
+    except ValueError:
+        print("Invalid URL")
+        sys.exit(1)
+
+    stream_id = 1
+
+    try:
+        request = build_frame(
+            REQUEST,
+            0,
+            stream_id,
+            [
+                (":path", path)
+            ]
+        )
+    except ValueError as error:
+        print(f"Request error: {error}")
+        sys.exit(1)
+
+    if verbose:
+        print_hexdump("Request frame:", request)
+
+    try:
+        with socket.create_connection((host, port)) as sock:
+
+            sock.sendall(request)
+
+            fixed = recv_exact(sock, 10)
+
+            if fixed is None:
+                print("Connection closed before response")
+                sys.exit(1)
+
+            length = int.from_bytes(
+                fixed[0:3],
+                "big"
+            )
+
+            frame_type = fixed[3]
+            flags = fixed[4]
+            response_stream_id = struct.unpack(
+                ">I",
+                fixed[5:9]
+            )[0]
+            header_count = fixed[9]
+
+            if length > MAX_FRAME_SIZE:
+                print("Invalid frame length")
+                sys.exit(1)
+
+            body = recv_exact(sock, length)
+
+            if body is None:
+                print("Incomplete response frame")
+                sys.exit(1)
+
+            frame = fixed + body
+
+            if verbose:
+                print_hexdump("Response frame:", frame)
+
+            if frame_type != RESPONSE:
+                print("Unexpected response frame type")
+                sys.exit(1)
+
+            if response_stream_id != stream_id:
+                print("Stream ID mismatch")
+                sys.exit(1)
+
+            try:
+                headers, payload = decode_headers(
+                    body,
+                    header_count
+                )
+            except (ValueError, UnicodeDecodeError):
+                print("Malformed response")
+                sys.exit(1)
+
+            status = None
+
+            for name, value in headers:
+                if name == ":status":
+                    status = int(value)
+
+            if status is None:
+                print("Missing status")
+                sys.exit(1)
+
+            if status == 200:
+                sys.stdout.buffer.write(payload)
+                sys.stdout.buffer.flush()
+                sys.exit(0)
+
+            sys.exit(1)
+
+    except OSError as error:
+        print(f"Connection error: {error}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
